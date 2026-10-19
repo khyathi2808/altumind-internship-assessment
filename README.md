@@ -54,3 +54,12 @@
 - **Live map link is separate and not linked anywhere in the candidate app** (`admin.html`) — candidates have no path to it from `index.html`.
 
 **Important consequence:** combined with the earlier no-resume limitation, if a candidate's browser crashes, their network drops, or they accidentally close the tab mid-session, **they cannot get back in** — the Sessions sheet already has a "started" row for their email, so `check_attempt` will block them. You'll need a manual override path — the simplest is deleting or editing that candidate's row in the `Sessions` tab yourself if a legitimate technical failure happens and they need a second chance. Worth deciding this policy before candidates start using it, since there's no in-app way for a candidate to self-recover.
+
+## Analytics dashboard and grading
+
+`dashboard/` is a static analytics dashboard (charts and a leaderboard), served by Pages at
+`/dashboard/`. It reads from this same Web App using the admin key. Written answers are
+first-pass scored by Claude (`ai.gs`) and video answers by Gemini (`video_grading.gs`), on one
+10-minute trigger (`grading_orchestrator.gs`), into a **Scores** tab. `ADMIN_KEY` now comes
+from Script properties, not `backend.gs`. Setup steps are in [dashboard/README.md](dashboard/README.md).
+`rubrics.gs` (the answer key) is private and never committed.

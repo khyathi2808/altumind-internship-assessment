@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Assessment Analytics Dashboard</title>
+<link rel="stylesheet" href="style.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+</head>
+<body>
+
+<header class="topbar">
+  <h1>Assessment Analytics Dashboard</h1>
+  <div class="topbar-right">
+    <span id="statusLine" class="muted small"></span>
+    <button id="refreshBtn" class="btn">Refresh</button>
+    <button id="changeBackend" class="btn btn-ghost">Change backend</button>
+  </div>
+</header>
+
+<section id="connectScreen" class="connect-screen">
+  <form id="connectForm" class="connect-card">
+    <h2>Connect to your assessment backend</h2>
+    <p class="muted">
+      This dashboard is static — it has no server of its own. It fetches your data directly
+      from your Apps Script Web App, in your browser, using the same admin key your review
+      dashboard uses. Nothing is sent anywhere else.
+    </p>
+    <label>Web App URL
+      <input id="endpointInput" type="url" placeholder="https://script.google.com/macros/s/.../exec" required>
+    </label>
+    <label>Admin key
+      <input id="keyInput" type="password" placeholder="Your ADMIN_KEY" required autocomplete="off">
+    </label>
+    <p class="muted small">
+      The admin key is kept only in this browser tab's session storage — it is never written
+      to this repository, never sent anywhere but your own backend, and clears when you close
+      the tab.
+    </p>
+    <button type="submit" class="btn btn-primary">Connect</button>
+    <p id="connectError" class="error hidden"></p>
+  </form>
+</section>
+
+<main id="dashboard" class="dashboard hidden">
+
+  <div id="statCards" class="stat-grid"></div>
+
+  <section class="grading-card">
+    <div class="grading-header">
+      <h3>Grading of written and video answers</h3>
+      <button id="runGradingBtn" class="btn btn-primary">Run grading batch now</button>
+    </div>
+    <div id="gradingStats" class="grading-stats muted small">Checking grading status…</div>
+    <p id="gradingNote" class="muted small">
+      Multiple-choice answers are graded automatically from the answer key. Written answers are
+      first-pass scored by AI and video answers by Gemini, on the backend's 10-minute trigger
+      (or this button). A reviewer's score always replaces the AI's.
+    </p>
+  </section>
+
+  <section class="chart-grid">
+    <div class="chart-card">
+      <h3>Funnel</h3>
+      <canvas id="funnelChart"></canvas>
+    </div>
+    <div class="chart-card">
+      <h3>Status breakdown</h3>
+      <canvas id="statusChart"></canvas>
+    </div>
+    <div class="chart-card">
+      <h3>Candidates by role</h3>
+      <canvas id="roleChart"></canvas>
+    </div>
+    <div class="chart-card">
+      <h3>AI vs. human scoring coverage</h3>
+      <canvas id="coverageChart"></canvas>
+    </div>
+  </section>
+
+  <section class="chart-grid">
+    <div class="chart-card">
+      <h3>Quantitative score distribution</h3>
+      <canvas id="quantHist"></canvas>
+    </div>
+    <div class="chart-card">
+      <h3>Communication score distribution</h3>
+      <canvas id="commHist"></canvas>
+    </div>
+    <div class="chart-card">
+      <h3>Behavioral score distribution</h3>
+      <canvas id="behHist"></canvas>
+    </div>
+    <div class="chart-card">
+      <h3>Total score distribution</h3>
+      <canvas id="totalHist"></canvas>
+    </div>
+  </section>
+
+  <section class="chart-card wide">
+    <h3>MCQ difficulty (% correct) — red bars discriminate poorly between strong and weak candidates</h3>
+    <canvas id="difficultyChart" height="90"></canvas>
+  </section>
+
+  <section class="leaderboard-card">
+    <div class="leaderboard-header">
+      <h3>Leaderboard</h3>
+      <div class="leaderboard-controls">
+        <input id="searchBox" type="search" placeholder="Search name or email…">
+        <select id="roleFilter"></select>
+        <select id="statusFilter"></select>
+        <span id="leaderboardCount" class="muted small"></span>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table id="leaderboardTable">
+        <thead>
+          <tr>
+            <th data-sort="total">#</th>
+            <th data-sort="name">Candidate</th>
+            <th>Roles</th>
+            <th data-sort="quant">Quant</th>
+            <th data-sort="comm">Comm</th>
+            <th data-sort="beh">Beh</th>
+            <th data-sort="total">Total</th>
+            <th data-sort="status">Status</th>
+            <th>Unscored</th>
+            <th>Flags</th>
+          </tr>
+        </thead>
+        <tbody id="leaderboardBody"></tbody>
+      </table>
+    </div>
+    <p class="muted small">
+      For per-question scoring, model answers, or to score an individual answer, use your
+      reviewer dashboard (review.html) — this view is for the aggregate picture only.
+    </p>
+  </section>
+
+</main>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
