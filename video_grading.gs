@@ -15,8 +15,10 @@
  *                        for a first-pass grader scoring hundreds of 90-second clips; you
  *                        don't need a Pro-tier model for this.
  *  3. Run videoCheck() once from the editor and approve permissions.
- *  4. Use grading_orchestrator.gs's combined trigger (recommended once both scorers are
- *     configured), or run videoScoreBatch() / videoRun_() by hand.
+ *  4. To run text and video in parallel: run gradingRemoveTrigger() (stops the combined
+ *     trigger), then aiInstallTrigger() and videoInstallTrigger(). Each gets its own 10-minute
+ *     trigger and lock. Or keep grading_orchestrator.gs's single combined trigger, or run
+ *     videoScoreBatch() by hand.
  *
  * What it does: for every video answer belonging to an eligible, ended candidate that has
  * no score yet (AI or human), downloads the clip from Drive, sends it to Gemini (inline when
@@ -75,7 +77,10 @@ function videoPending_(ss, eligible){
     const seen = {};
     info.rows.forEach(r => {
       const qid = norm(r["Question ID"]), it = RUBRICS.items[qid];
-      if(!it || it.kind !== "subjective" || !it.video || seen[qid] || done[email + "|" + qid] || !gradingAnswerFinal_(info, it)) return;
+      if(!it || it.kind !== "subjective" || !it.video || seen[qid] || done[email + "|" + qid]) return;
+      // Videos are Session 1 items: grade once that session has ended. (info.ended is absent
+      // with an older common.gs, which only returns candidates who finished both sessions.)
+      if(info.ended && !info.ended.session1) return;
       const link = norm(r["Video Link"]); if(!link) return;
       seen[qid] = true;
       out.push({email:email, qid:qid, link:link, timeSpentSec:Number(r["Time Spent (sec)"]) || null, pct:info.pct});
@@ -196,7 +201,9 @@ function videoParse_(txt){
  *  defaults to VIDEO_BUDGET_MS when run standalone. */
 function videoRun_(budgetMs){
   if(!videoConfigured_()) return {ok:false, error:"Video AI is not configured. Add GEMINI_API_KEY and GEMINI_MODEL in Script properties."};
-  const lock = LockService.getScriptLock(); if(!lock.tryLock(5000)) return {ok:false, error:"Another video AI run is in progress."};
+  // User lock, not the script lock ai.gs takes: the two scorers can then run at the same time
+  // on separate triggers, while two video runs still never overlap (triggers all run as the owner).
+  const lock = LockService.getUserLock(); if(!lock.tryLock(5000)) return {ok:false, error:"Another video AI run is in progress."};
   try{
     const ss = SpreadsheetApp.openById(SHEET_ID), t0 = Date.now(), budget = budgetMs || VIDEO_BUDGET_MS, sh = getOrCreateSheet(ss, SCORES_TAB, SCORES_HEADERS);
     const c = videoProps_();
@@ -241,6 +248,11 @@ function videoRun_(budgetMs){
   } finally { lock.releaseLock(); }
 }
 function videoScoreBatch(){ const r = videoRun_(); Logger.log(JSON.stringify(r)); }
+
+/** Own 10-minute trigger, so video scoring runs in parallel with ai.gs's text trigger instead
+ *  of getting the leftover time after text inside grading_orchestrator.gs. */
+function videoInstallTrigger(){ videoRemoveTrigger(); ScriptApp.newTrigger("videoScoreBatch").timeBased().everyMinutes(10).create(); }
+function videoRemoveTrigger(){ ScriptApp.getProjectTriggers().forEach(t => { if(t.getHandlerFunction() === "videoScoreBatch") ScriptApp.deleteTrigger(t); }); }
 function videoStatus_(){
   const ss = SpreadsheetApp.openById(SHEET_ID);
   return {ok:true, configured:videoConfigured_(), pending:videoPending_(ss, gradingEligibleCandidates_(ss, AI_MCQ_MIN)).length};
