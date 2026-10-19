@@ -19,7 +19,8 @@
  *     configured), or run videoScoreBatch() / videoRun_() by hand.
  *
  * What it does: for every video answer belonging to an eligible, ended candidate that has
- * no score yet (AI or human), downloads the clip from Drive, sends it inline to Gemini
+ * no score yet (AI or human), downloads the clip from Drive, sends it to Gemini (inline when
+ * small, through the Gemini Files API when larger)
  * alongside the item's rubric, and writes one row to the Scores tab under reviewer "AI" —
  * the exact same shape as a text AI score, so the existing dashboard (review.html) picks
  * it up automatically through the same scoreFor() lookup it already uses for every other
@@ -38,7 +39,12 @@
  * Eligibility, retry/backoff and shared logging live in common.gs (shared with ai.gs).
  */
 const VIDEO_BUDGET_MS = 4 * 60 * 1000;            // default when run standalone; grading_orchestrator.gs overrides this
-const VIDEO_MAX_INLINE_BYTES = 18 * 1024 * 1024;  // Gemini's inline-data guidance is "under ~20MB"; 90s clips should never get close
+// Gemini caps a whole inline request near 20MB, and base64 adds a third, so only clips up to
+// ~14MB go inline. Larger ones (most 90s webm clips are 20-30MB) go through the Gemini Files
+// API instead, up to UrlFetchApp's 50MB payload ceiling. Anything bigger is handed to a human.
+const VIDEO_MAX_INLINE_BYTES = 14 * 1024 * 1024;
+const VIDEO_MAX_UPLOAD_BYTES = 45 * 1024 * 1024;
+const VIDEO_UPLOAD_WAIT_MS = 90 * 1000;           // how long to wait for Gemini to finish processing an upload
 const VIDEO_FAIL_FAST_AFTER = 3;                  // video calls are expensive (download + large payload); fail faster than text's 5
 
 function videoProps_(){
@@ -108,18 +114,55 @@ function videoUserPrompt_(it, timeSpentSec){
 
 /** Downloads the Drive video. Throws if the link doesn't parse or the file can't be read
  *  (e.g. it was moved out of the service account's reach). */
-function videoFetchBlob_(link){
+function videoDriveFile_(link){
   const id = driveFileIdFromUrl_(link);
   if(!id) throw new Error("Could not parse a Drive file id from: " + link);
-  const blob = DriveApp.getFileById(id).getBlob();
-  return {bytes:blob.getBytes(), mimeType:blob.getContentType() || "video/webm"};
+  return DriveApp.getFileById(id);
 }
 
-function videoCallGemini_(c, it, bytes, mimeType, timeSpentSec){
+/** Response header lookup that ignores case (UrlFetchApp keeps whatever case the server sent). */
+function videoHeader_(res, name){
+  const h = res.getAllHeaders(), want = name.toLowerCase();
+  const k = Object.keys(h).find(x => x.toLowerCase() === want);
+  return k ? String(h[k]) : "";
+}
+
+/** Uploads a clip through the Gemini Files API (resumable protocol) and waits until Gemini has
+ *  finished processing it. Returns {name, uri, mimeType}; delete it with videoDeleteUpload_. */
+function videoUpload_(c, bytes, mimeType){
+  const base = "https://generativelanguage.googleapis.com";
+  const start = fetchWithRetry_(base + "/upload/v1beta/files", {method:"post", contentType:"application/json",
+    headers:{"x-goog-api-key":c.key, "X-Goog-Upload-Protocol":"resumable", "X-Goog-Upload-Command":"start",
+      "X-Goog-Upload-Header-Content-Length":String(bytes.length), "X-Goog-Upload-Header-Content-Type":mimeType},
+    payload:JSON.stringify({file:{display_name:"assessment-clip"}})});
+  const uploadUrl = videoHeader_(start, "x-goog-upload-url");
+  if(start.getResponseCode() !== 200 || !uploadUrl) throw new Error("Gemini upload start " + start.getResponseCode() + ": " + start.getContentText().slice(0, 200));
+
+  const done = fetchWithRetry_(uploadUrl, {method:"post", contentType:mimeType,
+    headers:{"X-Goog-Upload-Offset":"0", "X-Goog-Upload-Command":"upload, finalize"}, payload:bytes}, 1);
+  if(done.getResponseCode() !== 200) throw new Error("Gemini upload " + done.getResponseCode() + ": " + done.getContentText().slice(0, 200));
+  let file = JSON.parse(done.getContentText()).file;
+
+  const t0 = Date.now();
+  while(file.state === "PROCESSING" && Date.now() - t0 < VIDEO_UPLOAD_WAIT_MS){
+    Utilities.sleep(3000);
+    const res = fetchWithRetry_(base + "/v1beta/" + file.name, {method:"get", headers:{"x-goog-api-key":c.key}});
+    file = JSON.parse(res.getContentText());
+  }
+  if(file.state !== "ACTIVE"){ videoDeleteUpload_(c, file.name); throw new Error("Gemini upload not ready (state " + file.state + ")"); }
+  return {name:file.name, uri:file.uri, mimeType:file.mimeType || mimeType};
+}
+
+/** Best effort: uploads expire on their own after 48h anyway. */
+function videoDeleteUpload_(c, name){
+  try{ UrlFetchApp.fetch("https://generativelanguage.googleapis.com/v1beta/" + name, {method:"delete", headers:{"x-goog-api-key":c.key}, muteHttpExceptions:true}); } catch(e){}
+}
+
+function videoCallGemini_(c, it, mediaPart, timeSpentSec){
   const payload = {
     system_instruction:{parts:[{text:videoSystemPrompt_()}]},
     contents:[{parts:[
-      {inline_data:{mime_type:mimeType, data:Utilities.base64Encode(bytes)}},
+      mediaPart,
       {text:videoUserPrompt_(it, timeSpentSec)}
     ]}],
     generationConfig:{temperature:0, maxOutputTokens:400, responseMimeType:"application/json"}
@@ -162,13 +205,24 @@ function videoRun_(budgetMs){
     let scored = 0, failed = 0, flagged = 0, skippedLarge = 0;
     for(let i = 0; i < pending.length && Date.now() - t0 < budget; i++){
       const p = pending[i];
+      let upload = null;
       try{
-        const {bytes, mimeType} = videoFetchBlob_(p.link);
-        if(bytes.length > VIDEO_MAX_INLINE_BYTES){
-          skippedLarge++; aiLog_(ss, "[video] too large (" + bytes.length + " bytes) for inline scoring, left for a human: " + p.qid + " " + p.email);
+        const file = videoDriveFile_(p.link), size = file.getSize(); // size check first: no download for clips we can't send
+        if(size > VIDEO_MAX_UPLOAD_BYTES){
+          // Written as a -1 row so it is retired, not re-downloaded on every run.
+          skippedLarge++; aiLog_(ss, "[video] too large (" + size + " bytes) to send to Gemini, left for a human: " + p.qid + " " + p.email);
+          sh.appendRow([new Date(), "AI", safeCell_(p.email), p.qid, -1, "[]", "AI skipped: video too large to send. Score by hand."]);
           continue;
         }
-        const r = videoParse_(videoCallGemini_(c, RUBRICS.items[p.qid], bytes, mimeType, p.timeSpentSec));
+        const blob = file.getBlob(), bytes = blob.getBytes(), mimeType = blob.getContentType() || "video/webm";
+        let mediaPart;
+        if(bytes.length <= VIDEO_MAX_INLINE_BYTES){
+          mediaPart = {inline_data:{mime_type:mimeType, data:Utilities.base64Encode(bytes)}};
+        } else {
+          upload = videoUpload_(c, bytes, mimeType);
+          mediaPart = {file_data:{mime_type:upload.mimeType, file_uri:upload.uri}};
+        }
+        const r = videoParse_(videoCallGemini_(c, RUBRICS.items[p.qid], mediaPart, p.timeSpentSec));
         if(r.injection){
           flagged++; aiLog_(ss, "[video] possible instruction inside clip, left for a human: " + p.qid + " " + p.email);
           sh.appendRow([new Date(), "AI", safeCell_(p.email), p.qid, -1, "[]", "AI declined: the clip tries to instruct the scorer. Score by hand."]);
@@ -179,6 +233,8 @@ function videoRun_(budgetMs){
       }catch(err){
         failed++; aiLog_(ss, "[video] " + p.qid + " " + p.email + ": " + err.message);
         if(failed >= VIDEO_FAIL_FAST_AFTER) break;
+      } finally {
+        if(upload) videoDeleteUpload_(c, upload.name);
       }
     }
     return {ok:true, scored:scored, failed:failed, flagged:flagged, skippedLarge:skippedLarge, remaining:Math.max(0, pending.length - scored - flagged - skippedLarge)};
